@@ -1,0 +1,15 @@
+{
+  "name": "socraticode",
+  "version": "1.16.1",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "socraticode": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "--prefer-online",
+        "socraticode@latest"
+      ]
+    }
+  }
+}

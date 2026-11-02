@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+//
+// Tests for issue #55: re-thrown Qdrant errors must surface with operation
+// context (function name, parameters, status code, original message) instead
+// of the bare "Internal Server Error" the Qdrant REST client produces. Without
+// this wrapping the only signal a tool consumer gets via MCP is the literal
+// string "Internal Server Error" with no clue about which operation failed.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../../src/services/logger.js", () => ({
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+const mockGetCollection = vi.fn();
+const mockGetCollections = vi.fn();
+const mockRetrieve = vi.fn();
+const mockCreateCollection = vi.fn();
+const mockCreatePayloadIndex = vi.fn();
+
+vi.mock("@qdrant/js-client-rest", () => ({
+  QdrantClient: class {
+    getCollection = mockGetCollection;
+    getCollections = mockGetCollections;
+    retrieve = mockRetrieve;
+    createCollection = mockCreateCollection;
+    createPayloadIndex = mockCreatePayloadIndex;
+  },
+}));
+
+describe("qdrant error wrapping (issue #55)", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockGetCollection.mockReset();
+    mockGetCollections.mockReset();
+    mockRetrieve.mockReset();
+    mockCreateCollection.mockReset();
+    mockCreatePayloadIndex.mockReset();
+    // Default: metadata collection already exists, so ensureMetadataCollection
+    // returns without trying to create one. Tests that need a fresh state
+    // override this in their own setup.
+    mockGetCollections.mockResolvedValue({
+      collections: [{ name: "socraticode_metadata" }],
+    });
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("getCollectionInfo", () => {
+    it("still returns null on 404 (collection-not-found is not an error)", async () => {
+      const notFound: Error & { status?: number } = new Error("Not found");
+      notFound.status = 404;
+      mockGetCollection.mockRejectedValueOnce(notFound);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      const result = await getCollectionInfo("missing_collection");
+      expect(result).toBeNull();
+    });
+
+    it("wraps non-404 errors with operation name, collection, and status", async () => {
+      const serverErr: Error & { status?: number } = new Error("Internal Server Error");
+      serverErr.status = 500;
+      mockGetCollection.mockRejectedValueOnce(serverErr);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      await expect(getCollectionInfo("some_collection")).rejects.toThrow(
+        /getCollectionInfo\(collection=some_collection\) failed \[status 500\]: Internal Server Error/,
+      );
+    });
+
+    it("preserves the original error via `cause`", async () => {
+      const originalErr: Error & { status?: number } = new Error("boom");
+      originalErr.status = 503;
+      mockGetCollection.mockRejectedValueOnce(originalErr);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      try {
+        await getCollectionInfo("c1");
+        expect.fail("expected throw");
+      } catch (err) {
+        expect((err as Error & { cause?: unknown }).cause).toBe(originalErr);
+      }
+    });
+
+    // #178: the client's `message` is only the HTTP status text; the reason the
+    // server gave is on `data.status.error` and must survive the wrap, once.
+    const REASON = "Service internal error: 0 of 0 read operations failed";
+
+    it("includes Qdrant's reason exactly once, keeping the message shape and cause", async () => {
+      const apiError = Object.assign(new Error("Internal Server Error"), {
+        status: 500,
+        data: { status: { error: REASON } },
+      });
+      mockGetCollection.mockRejectedValueOnce(apiError);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      const err = (await getCollectionInfo("some_collection").catch((e: unknown) => e)) as Error & {
+        cause?: unknown;
+      };
+
+      expect(err.message).toBe(
+        `getCollectionInfo(collection=some_collection) failed [status 500]: Internal Server Error: ${REASON}`,
+      );
+      expect(err.message.split(REASON)).toHaveLength(2);
+      expect(err.cause).toBe(apiError);
+    });
+
+    it("does not repeat a reason the underlying message already carries", async () => {
+      const apiError = Object.assign(new Error(`Internal Server Error: ${REASON}`), {
+        status: 500,
+        data: { status: { error: REASON } },
+      });
+      mockGetCollection.mockRejectedValueOnce(apiError);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      const err = (await getCollectionInfo("some_collection").catch((e: unknown) => e)) as Error;
+
+      expect(err.message.split(REASON)).toHaveLength(2);
+    });
+
+    it("still returns null on a 404 that carries a Qdrant reason", async () => {
+      const notFound = Object.assign(new Error("Not Found"), {
+        status: 404,
+        data: { status: { error: "Not found: Collection `missing_collection` doesn't exist!" } },
+      });
+      mockGetCollection.mockRejectedValueOnce(notFound);
+
+      const { getCollectionInfo } = await import("../../src/services/qdrant.js");
+      await expect(getCollectionInfo("missing_collection")).resolves.toBeNull();
+    });
+  });
+
+  describe("loadProjectHashes", () => {
+    it("wraps Qdrant errors with collName context", async () => {
+      const serverErr: Error & { status?: number } = new Error("Internal Server Error");
+      serverErr.status = 500;
+      mockRetrieve.mockRejectedValueOnce(serverErr);
+
+      const { loadProjectHashes } = await import("../../src/services/qdrant.js");
+      await expect(loadProjectHashes("codebase_xyz")).rejects.toThrow(
+        /loadProjectHashes\(collName=codebase_xyz\) failed \[status 500\]: Internal Server Error/,
+      );
+    });
+
+    it("includes original error as `cause`", async () => {
+      const original: Error & { statusCode?: number } = new Error("connection refused");
+      original.statusCode = 502;
+      mockRetrieve.mockRejectedValueOnce(original);
+
+      const { loadProjectHashes } = await import("../../src/services/qdrant.js");
+      try {
+        await loadProjectHashes("codebase_abc");
+        expect.fail("expected throw");
+      } catch (err) {
+        expect((err as Error).message).toContain("loadProjectHashes(collName=codebase_abc)");
+        expect((err as Error).message).toContain("[status 502]");
+        expect((err as Error).message).toContain("connection refused");
+        expect((err as Error & { cause?: unknown }).cause).toBe(original);
+      }
+    });
+
+    it("works without a status code on the underlying error", async () => {
+      const noStatus: Error = new Error("opaque failure");
+      mockRetrieve.mockRejectedValueOnce(noStatus);
+
+      const { loadProjectHashes } = await import("../../src/services/qdrant.js");
+      await expect(loadProjectHashes("codebase_no_status")).rejects.toThrow(
+        /loadProjectHashes\(collName=codebase_no_status\) failed: opaque failure/,
+      );
+    });
+  });
+});
+
+// ── describeQdrantError (#89) ────────────────────────────────────────────
+//
+// A Qdrant 400 arrives as an ApiError whose `message` is only the HTTP status
+// text ("Bad Request"); the server's actual explanation lives in
+// `err.data.status.error`. Logging just `.message` is what made every failed
+// symbol-graph persist look identical and unactionable.
+
+describe("describeQdrantError", () => {
+  it("appends the server's reason from err.data.status.error", async () => {
+    const { describeQdrantError } = await import("../../src/services/qdrant.js");
+    const apiError = Object.assign(new Error("Bad Request"), {
+      status: 400,
+      data: { status: { error: "JSON payload (35651584 bytes) is larger than allowed (limit: 33554432 bytes)" } },
+    });
+    const described = describeQdrantError(apiError);
+    expect(described).toContain("Bad Request");
+    expect(described).toContain("larger than allowed");
+    expect(described).toContain("33554432");
+  });
+
+  it("finds the reason through a wrapped error's cause chain", async () => {
+    const { describeQdrantError } = await import("../../src/services/qdrant.js");
+    const inner = Object.assign(new Error("Bad Request"), {
+      data: { status: { error: "payload too large" } },
+    });
+    const outer = Object.assign(new Error("saveFilePayloads failed [status 400]: Bad Request"), { cause: inner });
+    expect(describeQdrantError(outer)).toContain("payload too large");
+  });
+
+  it("does not duplicate the reason when it is already in the message", async () => {
+    const { describeQdrantError } = await import("../../src/services/qdrant.js");
+    const err = Object.assign(new Error("failed: payload too large"), {
+      data: { status: { error: "payload too large" } },
+    });
+    expect(describeQdrantError(err)).toBe("failed: payload too large");
+  });
+
+  it("falls back to the plain message when there is no structured reason", async () => {
+    const { describeQdrantError } = await import("../../src/services/qdrant.js");
+    expect(describeQdrantError(new Error("Bad Request"))).toBe("Bad Request");
+    expect(describeQdrantError("not an error")).toBe("not an error");
+  });
+});
